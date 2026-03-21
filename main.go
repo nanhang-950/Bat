@@ -5,148 +5,283 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"time"
-
-	"github.com/schollz/progressbar/v3"
 )
+
+type scanTask struct {
+	IP   string
+	Port int
+}
+
+type osResult struct {
+	IP string
+	OS string
+}
 
 func main() {
 	fn.Banner()
 	fmt.Printf("\n扫描开始，请耐心等待\n")
 
-	// 获取网卡ip
-	cidrs := fn.Getlocalip()
-
-	// 定义一个用于存储ip的切片
-	var allIPs []string
-
-	// 创建一个新的进度条 并在接下来分成三份来进行进度条累加
-	bar := progressbar.Default(int64(len(cidrs) * 100))
-	barLength := (len(cidrs) * 100) / 4 // 用于循环的次数
-	count := 0
-
-	// 遍历每个cidr地址段
-	for _, cidr := range cidrs {
-		ips, err := fn.GenerateIPs(cidr)
-		if err != nil {
-			fmt.Println("错误:", err)
-			continue
-		}
-		allIPs = append(allIPs, ips...)
-	}
-
-	//第一次循环累加进度条
-	for i := 0; i < barLength; i++ {
-		count++
-		time.Sleep(10 * time.Millisecond) //假设任务耗时
-		bar.Add(1)
-		if count == barLength {
-			count = 0
-			break
-		}
-	}
-
-	// 常见端口列表
-	var commonPorts = []int{80, 443, 22, 21, 3389, 25, 23, 137, 138, 139, 3389}
-
-	// 并发扫描
-	var wg sync.WaitGroup
-	results1 := make(chan string, len(allIPs))
-
-	// 并发数
-	const maxConcurrency = 700
-	semaphore := make(chan struct{}, maxConcurrency)
-
 	start := time.Now()
 
-	// 扫描 IP 地址
-	for _, ip := range allIPs {
-		wg.Add(1)
-		go func(ip string) {
-			defer wg.Done()
-			semaphore <- struct{}{}        // 请求一个槽位
-			defer func() { <-semaphore }() // 释放一个槽位
+	cidrs, err := fn.Getlocalip()
+	if err != nil {
+		fmt.Printf("获取本地网段失败：%v\n", err)
+		waitForExit()
+		return
+	}
+	if len(cidrs) == 0 {
+		fmt.Println("未发现可用的内网网段，已跳过扫描。")
+		waitForExit()
+		return
+	}
 
-			//默认使用Icmp扫描存活，如果Icmp失败则使用Tcp
-			if fn.IcmpScan(ip) {
-				results1 <- ip
-			} else if fn.TcpScan(ip, commonPorts) {
-				results1 <- ip
+	targetCount := countTargetIPs(cidrs)
+	if targetCount == 0 {
+		fmt.Println("未生成可扫描的主机地址，已跳过扫描。")
+		waitForExit()
+		return
+	}
+
+	fmt.Printf("发现 %d 个内网网段，待探测地址 %d 个\n", len(cidrs), targetCount)
+	aliveIPs := discoverAliveHostsFromCIDRs(cidrs, fn.CommonPorts, 256)
+	fmt.Printf("发现 %d 台存活主机\n", len(aliveIPs))
+
+	results := scanOpenPorts(aliveIPs, fn.DefaultPorts, 512)
+	results = enrichResultsWithOS(results, 128)
+	fmt.Printf("发现 %d 个开放端口\n", len(results))
+
+	aiText, err := fn.ProcessWebSocketData(results)
+	if err != nil {
+		fmt.Printf("AI 分析已跳过：%v\n", err)
+	}
+
+	if err := fn.Savefile(results, aiText, aliveIPs); err != nil {
+		fmt.Printf("扫描报告生成失败：%v\n", err)
+		waitForExit()
+		return
+	}
+
+	fmt.Printf("\n扫描报告已生成：内网测绘报告.html\n")
+	fmt.Printf("用时： %.2f 秒\n", time.Since(start).Seconds())
+	waitForExit()
+}
+
+func countTargetIPs(cidrs []string) int {
+	total := 0
+	for _, cidr := range cidrs {
+		count, err := fn.EstimateUsableHosts(cidr)
+		if err != nil {
+			fmt.Printf("统计网段 %s 失败：%v\n", cidr, err)
+			continue
+		}
+		total += count
+	}
+	return total
+}
+
+func discoverAliveHostsFromCIDRs(cidrs []string, commonPorts []int, maxWorkers int) []string {
+	if len(cidrs) == 0 {
+		return nil
+	}
+	if maxWorkers <= 0 {
+		maxWorkers = 1
+	}
+
+	jobs := make(chan string, maxWorkers*2)
+	results := make(chan string, maxWorkers)
+
+	var wg sync.WaitGroup
+	for i := 0; i < maxWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ip := range jobs {
+				if fn.IcmpScan(ip) || fn.TcpScan(ip, commonPorts) {
+					results <- ip
+				}
 			}
-		}(ip)
+		}()
 	}
 
 	go func() {
-		wg.Wait()
-		close(results1)
+		defer close(jobs)
+
+		seen := make(map[string]struct{})
+		for _, cidr := range cidrs {
+			err := fn.WalkIPs(cidr, func(ip string) bool {
+				if _, ok := seen[ip]; ok {
+					return true
+				}
+				seen[ip] = struct{}{}
+				jobs <- ip
+				return true
+			})
+			if err != nil {
+				fmt.Printf("遍历网段 %s 失败：%v\n", cidr, err)
+			}
+		}
 	}()
 
-	//第二次循环累加进度条
-	for i := 0; i < barLength; i++ {
-		count++
-		time.Sleep(100 * time.Millisecond) //假设任务耗时
-		bar.Add(1)
-		if count == barLength {
-			count = 0
-			break
-		}
-	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
 
+	aliveSet := make(map[string]struct{})
 	var aliveIPs []string
-
-	for ip := range results1 {
+	for ip := range results {
+		if _, ok := aliveSet[ip]; ok {
+			continue
+		}
+		aliveSet[ip] = struct{}{}
 		aliveIPs = append(aliveIPs, ip)
 	}
 
-	results2 := make(chan fn.ScanResult, len(aliveIPs)*len(fn.DefaultPorts))
-	results2Copy := make(chan fn.ScanResult, len(aliveIPs)*len(fn.DefaultPorts))
+	sortIPs(aliveIPs)
+	return aliveIPs
+}
 
-	for _, ip := range aliveIPs {
-		portsTask := make(chan int, len(fn.DefaultPorts))
-		for _, port := range fn.DefaultPorts {
-			portsTask <- port
-		}
-		close(portsTask)
-
-		for threads := 0; threads < 600; threads++ {
-			wg.Add(1)
-			go fn.Scan(ip, portsTask, results2, &wg)
-			wg.Add(1)
-			go fn.Scan(ip, portsTask, results2Copy, &wg)
-		}
+func scanOpenPorts(ips []string, ports []int, maxWorkers int) []fn.ScanResult {
+	if len(ips) == 0 || len(ports) == 0 {
+		return nil
 	}
 
-	//第三次循环累加进度条
-	for i := 0; i < barLength; i++ {
-		count++
-		time.Sleep(10 * time.Millisecond) //假设任务耗时
-		bar.Add(1)
-		if count == barLength {
-			count = 0
-			break
-		}
+	workers := workerCount(len(ips)*len(ports), maxWorkers)
+	jobs := make(chan scanTask, workers*2)
+	results := make(chan fn.ScanResult, workers*2)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range jobs {
+				result, ok := fn.ScanPort(task.IP, task.Port, 2*time.Second)
+				if ok {
+					results <- result
+				}
+			}
+		}()
 	}
 
 	go func() {
-		wg.Wait()
-		close(results2)
-		close(results2Copy)
+		defer close(jobs)
+		for _, ip := range ips {
+			for _, port := range ports {
+				jobs <- scanTask{IP: ip, Port: port}
+			}
+		}
 	}()
 
-	// 使用全局通道 调用ai扫描接口 来传递数据给AiInterface
-	fn.ProcessWebSocketData(results2Copy)
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
 
-	// 生成报告文件
-	fn.Savefile(results2)
+	var openPorts []fn.ScanResult
+	for result := range results {
+		openPorts = append(openPorts, result)
+	}
 
-	// 更新进度条至 100%
-	bar.Finish()
+	sort.Slice(openPorts, func(i, j int) bool {
+		if openPorts[i].IP != openPorts[j].IP {
+			return ipLess(openPorts[i].IP, openPorts[j].IP)
+		}
+		return openPorts[i].Port < openPorts[j].Port
+	})
 
-	// 输出扫描结果信息
-	fmt.Printf("\n扫描报告已生成：内网测绘报告.html\n")
-	fmt.Printf("用时： %.2f 秒\n", time.Since(start).Seconds())
+	return openPorts
+}
+
+func enrichResultsWithOS(results []fn.ScanResult, maxWorkers int) []fn.ScanResult {
+	if len(results) == 0 {
+		return results
+	}
+	if maxWorkers <= 0 {
+		maxWorkers = 1
+	}
+
+	seen := make(map[string]struct{})
+	ips := make([]string, 0, len(results))
+	for _, result := range results {
+		if _, ok := seen[result.IP]; ok {
+			continue
+		}
+		seen[result.IP] = struct{}{}
+		ips = append(ips, result.IP)
+	}
+
+	workers := workerCount(len(ips), maxWorkers)
+	jobs := make(chan string, workers*2)
+	osResults := make(chan osResult, workers*2)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ip := range jobs {
+				osResults <- osResult{IP: ip, OS: fn.GetOS(ip)}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, ip := range ips {
+			jobs <- ip
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(osResults)
+	}()
+
+	osByIP := make(map[string]string, len(ips))
+	for result := range osResults {
+		osByIP[result.IP] = result.OS
+	}
+
+	for i := range results {
+		osName := osByIP[results[i].IP]
+		if osName == "" {
+			osName = "Unknown"
+		}
+		results[i].OS = osName
+	}
+
+	return results
+}
+
+func workerCount(tasks, maxWorkers int) int {
+	if tasks <= 0 {
+		return 1
+	}
+	if maxWorkers <= 0 {
+		return 1
+	}
+	if tasks < maxWorkers {
+		return tasks
+	}
+	return maxWorkers
+}
+
+func sortIPs(ips []string) {
+	sort.Slice(ips, func(i, j int) bool {
+		return ipLess(ips[i], ips[j])
+	})
+}
+
+func ipLess(left, right string) bool {
+	return fn.CompareIPs(left, right) < 0
+}
+
+func waitForExit() {
 	fmt.Println("按回车键退出...")
 	reader := bufio.NewReader(os.Stdin)
-	reader.ReadString('\n')
+	_, _ = reader.ReadString('\n')
 }

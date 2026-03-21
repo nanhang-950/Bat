@@ -2,21 +2,24 @@ package fn
 
 import (
 	"os/exec"
-	"strconv"
+	"regexp"
+	"runtime"
 	"strings"
 )
+
+var ttlPattern = regexp.MustCompile(`(?i)ttl[=\s:]+(\d+)`)
 
 // GetOs 根据 TTL 值推断操作系统
 func GetOs(ttl int) string {
 	switch {
 	case ttl >= 128:
 		return "Windows"
-	case ttl >= 64 && ttl < 128:
+	case ttl >= 64:
 		return "Linux"
-	case ttl >= 32 && ttl < 64:
-		return "Cisco Router"
-	case ttl >= 60 && ttl < 64:
+	case ttl >= 60:
 		return "AIX"
+	case ttl >= 32:
+		return "Cisco Router"
 	default:
 		return "Unknown"
 	}
@@ -24,46 +27,54 @@ func GetOs(ttl int) string {
 
 // PingAndDetectOS 发送 ICMP 请求并检测操作系统
 func GetOS(ip string) string {
-	cmd := exec.Command("ping", "-c", "1", "-W", "1", ip)
-	output, err := cmd.CombinedOutput()
-  if err != nil {
-		for _, port := range CommonPorts {
-			if (port == 22 || port == 631 || port == 514 || port == 111) ||
-				(port == 135 || port == 139 || port == 445 || port == 3389 || port == 5985) {
-				if TcpScan(ip, []int{port}) {
-					if port == 22 || port == 631 || port == 514 || port == 111 {
-						return "Linux"
-					}
-					if port == 135 || port == 139 || port == 445 || port == 3389 || port == 5985 {
-						return "Windows"
-					}
-				}
-			}
-		}
-  }
-	lines := strings.Split(string(output), "\n")
-	var ttl int
-	for _, line := range lines {
-		if strings.Contains(line, "ttl=") {
-			fields := strings.Fields(line)
-			for _, field := range fields {
-				if strings.HasPrefix(field, "ttl=") {
-					ttlStr := strings.TrimPrefix(field, "ttl=")
-					ttl, err = strconv.Atoi(ttlStr)
-					if err != nil {
-						return ""
-					}
-					break
-				}
-			}
-			break
+	if cached, ok := OsCache.Load(ip); ok {
+		if osName, ok := cached.(string); ok {
+			return osName
 		}
 	}
 
-	if ttl == 0 {
+	osName := detectOS(ip)
+	OsCache.Store(ip, osName)
+	return osName
+}
+
+func detectOS(ip string) string {
+	ttl := pingTTL(ip)
+	if ttl > 0 {
+		return GetOs(ttl)
+	}
+
+	switch {
+	case TcpScan(ip, []int{22, 111, 514, 631}):
+		return "Linux"
+	case TcpScan(ip, []int{135, 139, 445, 3389, 5985}):
+		return "Windows"
+	default:
 		return "Unknown"
 	}
+}
 
-	os := GetOs(ttl)
-	return os
+func pingTTL(ip string) int {
+	output, err := exec.Command("ping", pingArgs(ip)...).CombinedOutput()
+	if err != nil && len(output) == 0 {
+		return 0
+	}
+
+	matches := ttlPattern.FindStringSubmatch(strings.ToLower(string(output)))
+	if len(matches) != 2 {
+		return 0
+	}
+
+	ttl := 0
+	for _, ch := range matches[1] {
+		ttl = ttl*10 + int(ch-'0')
+	}
+	return ttl
+}
+
+func pingArgs(ip string) []string {
+	if runtime.GOOS == "windows" {
+		return []string{"-n", "1", "-w", "1000", ip}
+	}
+	return []string{"-c", "1", "-W", "1", ip}
 }

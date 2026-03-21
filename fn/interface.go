@@ -1,195 +1,216 @@
 package fn
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
-/*
-   WebAPI 接口调用示例 接口文档（必看）：https://www.xfyun.cn/doc/spark/Web.html
-  错误码链接：https://www.xfyun.cn/doc/spark/%E6%8E%A5%E5%8F%A3%E8%AF%B4%E6%98%8E.html（code返回错误码时必看）
-*/
-
-var aiText []string
-
-var (
-	hostUrl   = "wss://spark-api.xf-yun.com/v3.5/chat"
-	appid     = "9bcdfbc5"
-	apiSecret = "NDZhNzZjNzRmYTU0ZDQ4NmNmM2NlYmY2"
-	apiKey    = "c2b637d838664be80412a417cf145377"
+const (
+	defaultAIHostURL = "https://generativelanguage.googleapis.com/v1beta/models"
+	defaultAIModel   = "gemini-2.0-flash"
+	aiRequestTimeout = 45 * time.Second
+	maxPromptResults = 400
 )
 
-func ProcessWebSocketData(results2 chan ScanResult) {
-	d := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
-	conn, resp, err := d.Dial(assembleAuthUrl1(hostUrl, apiKey, apiSecret), nil)
+type aiConfig struct {
+	HostURL string
+	Model   string
+	APIKey  string
+}
 
-	if err != nil {
-		fmt.Printf("无法建立连接：%v\n响应：%s\n", err, readResp(resp))
-		return
+func ProcessWebSocketData(results []ScanResult) ([]string, error) {
+	if len(results) == 0 {
+		return nil, nil
 	}
 
-	defer conn.Close()
+	cfg := loadAIConfig()
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
 
-	resultsStr := channelToString(results2)
-	question := resultsStr
-	go send(conn, appid, question)
+	answer, err := requestGeminiContent(cfg, resultsToPrompt(results))
+	if err != nil {
+		return nil, err
+	}
 
-	var answer string
+	return compactLines(strings.Split(strings.TrimSpace(answer), "\n")), nil
+}
 
-	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			fmt.Println("读取消息错误：", err)
+func requestGeminiContent(cfg aiConfig, question string) (string, error) {
+	reqBody := map[string]interface{}{
+		"system_instruction": map[string]interface{}{
+			"parts": []map[string]string{{
+				"text": "根据以下内网测绘结果，评估该内网的安全性，先分点说明风险与建议，最后给出一段总结。",
+			}},
+		},
+		"contents": []map[string]interface{}{{
+			"role": "user",
+			"parts": []map[string]string{{
+				"text": question,
+			}},
+		}},
+		"generationConfig": map[string]interface{}{
+			"temperature":     0.5,
+			"topK":            1,
+			"maxOutputTokens": 2048,
+		},
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("编码 Gemini 请求失败: %w", err)
+	}
+
+	endpoint := strings.TrimRight(cfg.HostURL, "/")
+	if strings.Contains(endpoint, ":generateContent") {
+		sep := "?"
+		if strings.Contains(endpoint, "?") {
+			sep = "&"
+		}
+		endpoint += sep + "key=" + url.QueryEscape(cfg.APIKey)
+	} else {
+		endpoint += "/" + cfg.Model + ":generateContent?key=" + url.QueryEscape(cfg.APIKey)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("创建 Gemini 请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{Timeout: aiRequestTimeout}).Do(req)
+	if err != nil {
+		return "", fmt.Errorf("调用 Gemini 失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("读取 Gemini 响应失败: %w", err)
+	}
+
+	var data struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	if err := json.Unmarshal(body, &data); err != nil {
+		if resp.StatusCode >= http.StatusBadRequest {
+			return "", fmt.Errorf("Gemini 接口返回异常 code=%d, body=%s", resp.StatusCode, string(body))
+		}
+		return "", fmt.Errorf("解析 Gemini 响应失败: %w", err)
+	}
+
+	if data.Error != nil {
+		return "", fmt.Errorf("Gemini 接口返回错误 code=%d: %s", data.Error.Code, data.Error.Message)
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return "", fmt.Errorf("Gemini 接口返回异常 code=%d, body=%s", resp.StatusCode, string(body))
+	}
+
+	var answer strings.Builder
+	for _, candidate := range data.Candidates {
+		for _, part := range candidate.Content.Parts {
+			answer.WriteString(part.Text)
+		}
+		if answer.Len() > 0 {
 			break
 		}
-
-		content, err := parseMessage(msg)
-		if err != nil {
-			fmt.Println("Error parsing JSON:", err)
-			return
-		}
-
-		answer += content
-		if Answer(content) {
-			break
-		}
 	}
 
-	aiText = strings.Split(answer, "\n")
+	if strings.TrimSpace(answer.String()) == "" {
+		return "", fmt.Errorf("Gemini 未返回有效内容")
+	}
 
+	return answer.String(), nil
 }
 
-func send(conn *websocket.Conn, appid, question string) {
-	data := genParams1(appid, question)
-	if err := conn.WriteJSON(data); err != nil {
-		fmt.Println("发生数据失败", err)
-	}
-}
-
-func parseMessage(msg []byte) (string, error) {
-	var data map[string]interface{}
-	if err := json.Unmarshal(msg, &data); err != nil {
-		return "", err
-	}
-	payload := data["payload"].(map[string]interface{})
-	choices := payload["choices"].(map[string]interface{})
-	header := data["header"].(map[string]interface{})
-	code := header["code"].(float64)
-
-	if code != 0 {
-		return "", fmt.Errorf("代码错误 %v: %v", code, data["payload"])
-	}
-
-	status := choices["status"].(float64)
-	text := choices["text"].([]interface{})
-	content := text[0].(map[string]interface{})["content"].(string)
-
-	if status == 2 {
-		return content, nil
-	}
-
-	return content, nil
-}
-
-func Answer(content string) bool {
-	return false
-}
-
-// 生成参数
-func genParams1(appid, question string) map[string]interface{} { // 根据实际情况修改返回的数据结构和字段名
-
-	messages := []Message{
-		{Role: "system", Content: "根据以下内网测绘的结果，请帮我评估这个内网的安全性，请先分点给出建议，并在最后总结一段输出文字"}, //设置对话背景或者模型角色
-		{Role: "user", Content: question},
-	}
-
-	return map[string]interface{}{ // 根据实际情况修改返回的数据结构和字段名
-		"header": map[string]interface{}{ // 根据实际情况修改返回的数据结构和字段名
-			"app_id": appid, //  应用appid，从开放平台控制台创建的应用中获取
-		},
-		"parameter": map[string]interface{}{ // 根据实际情况修改返回的数据结构和字段名
-			"chat": map[string]interface{}{ // 根据实际情况修改返回的数据结构和字段名
-				"domain":      "general", // 根据实际情况修改返回的数据结构和字段名
-				"temperature": 1.0,       // 核采样阈值。用于决定结果随机性，取值越高随机性越强即相同的问题得到的不同答案的可能性越高
-				"top_k":       1,         // 从k个候选中随机选择⼀个（⾮等概率）
-				"max_tokens":  2048,      // 模型回答的tokens的最大长度
-				"auditing":    "default", // 根据实际情况修改返回的数据结构和字段名
-			},
-		},
-		"payload": map[string]interface{}{ // 根据实际情况修改返回的数据结构和字段名
-			"message": map[string]interface{}{ // 根据实际情况修改返回的数据结构和字段名
-				"text": messages, // 根据实际情况修改返回的数据结构和字段名
-			},
-		},
-	}
-}
-
-// 创建鉴权url  apikey 即 hmac username
-func assembleAuthUrl1(hosturl, apiKey, apiSecret string) string {
-	ul, err := url.Parse(hosturl)
-	if err != nil {
-		fmt.Println("解析URL时错误", err)
+func resultsToPrompt(results []ScanResult) string {
+	if len(results) == 0 {
 		return ""
 	}
-	date := time.Now().UTC().Format(time.RFC1123)
-	signString := []string{"host: " + ul.Host, "date: " + date, "GET " + ul.Path + " HTTP/1.1"}
-	sgin := strings.Join(signString, "\n")
-	sha := HmacWithShaTobase64("hmac-sha256", sgin, apiSecret)
-	authUrl := fmt.Sprintf("hmac username=\"%s\", algorithm=\"%s\", headers=\"%s\", signature=\"%s\"", apiKey,
-		"hmac-sha256", "host date request-line", sha)
-	authorization := base64.StdEncoding.EncodeToString([]byte(authUrl))
 
-	v := url.Values{}
-	v.Add("host", ul.Host)
-	v.Add("date", date)
-	v.Add("authorization", authorization)
-	return hosturl + "?" + v.Encode()
-}
-
-func HmacWithShaTobase64(algorithm, data, key string) string {
-	mac := hmac.New(sha256.New, []byte(key))
-	mac.Write([]byte(data))
-	return base64.StdEncoding.EncodeToString(mac.Sum((nil)))
-}
-
-func readResp(resp *http.Response) string {
-	if resp == nil {
-		return ""
+	uniqueHosts := make(map[string]struct{})
+	for _, result := range results {
+		uniqueHosts[result.IP] = struct{}{}
 	}
-	b, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Sprintf("创建文件失败：%v", err)
+
+	limit := len(results)
+	if limit > maxPromptResults {
+		limit = maxPromptResults
 	}
-	return fmt.Sprintf("code=%d,body=%s", resp.StatusCode, string(b))
-}
 
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-// 将通道内的文字转字符串
-func channelToString(results2 chan ScanResult) string {
 	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("扫描摘要: 存活并开放端口的主机 %d 台，开放端口 %d 个。\n", len(uniqueHosts), len(results)))
+	for i := 0; i < limit; i++ {
+		result := results[i]
+		osName := result.OS
+		if osName == "" {
+			osName = "Unknown"
+		}
+		sb.WriteString(fmt.Sprintf("IP=%s OS=%s Port=%d Service=%s\n", result.IP, osName, result.Port, result.Protocol))
+	}
 
-	for result := range results2 {
-		sb.WriteString(fmt.Sprintf("%+v\n", result))
+	if limit < len(results) {
+		sb.WriteString(fmt.Sprintf("其余 %d 条开放端口记录已省略，请结合总量与样本综合评估风险。\n", len(results)-limit))
 	}
 
 	return sb.String()
 }
 
-// 定义一个方法返回处理后的结果给调用者
-func GetAiText() []string {
-	return aiText
+func compactLines(lines []string) []string {
+	var result []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		result = append(result, line)
+	}
+	return result
+}
+
+func loadAIConfig() aiConfig {
+	return aiConfig{
+		HostURL: getenvDefault("LLM_API_HOST_URL", defaultAIHostURL),
+		Model:   getenvDefault("LLM_MODEL", defaultAIModel),
+		APIKey:  strings.TrimSpace(os.Getenv("LLM_API_KEY")),
+	}
+}
+
+func (c aiConfig) validate() error {
+	if c.HostURL == "" {
+		return fmt.Errorf("AI Host 未配置")
+	}
+	if c.Model == "" {
+		return fmt.Errorf("AI Model 未配置")
+	}
+	if c.APIKey == "" {
+		return fmt.Errorf("未配置 LLM_API_KEY")
+	}
+	return nil
+}
+
+func getenvDefault(key, fallback string) string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	return value
 }

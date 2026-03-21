@@ -1,46 +1,4 @@
-package fn
 
-import (
-	"html/template"
-	"os"
-	"sort"
-	"strconv"
-	"time"
-)
-
-type reportHost struct {
-	IP      string
-	OS      string
-	Results []ScanResult
-}
-
-type reportCount struct {
-	Name  string
-	Count int
-}
-
-type reportData struct {
-	Hosts             []reportHost
-	AiText            []string
-	GeneratedAt       string
-	TotalAliveHosts   int
-	HostsWithOpenPort int
-	TotalOpenPorts    int
-	TopPorts          []reportCount
-	TopProtocols      []reportCount
-}
-
-// Savefile 将扫描结果格式化为HTML并写入到result.html文件中
-func Savefile(results []ScanResult, aiText, aliveIPs []string) error {
-	file, err := os.Create("内网测绘报告.html")
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	data := buildReportData(results, aiText, aliveIPs)
-
-	tmpl := `
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -230,25 +188,25 @@ func Savefile(results []ScanResult, aiText, aliveIPs []string) error {
 	<div class="wrapper">
 		<section class="hero">
 			<h1>内网测绘报告</h1>
-			<p>这份报告汇总了当前扫描任务发现的主机、开放端口与协议分布，并在末尾附上可选的 AI 风险分析结果。生成时间：{{.GeneratedAt}}</p>
+			<p>这份报告汇总了当前扫描任务发现的主机、开放端口与协议分布，并在末尾附上可选的 AI 风险分析结果。生成时间：2026-03-21 23:42:54</p>
 		</section>
 
 		<section class="summary">
 			<div class="card">
 				<div class="label">存活主机数</div>
-				<div class="value">{{.TotalAliveHosts}}</div>
+				<div class="value">2</div>
 			</div>
 			<div class="card">
 				<div class="label">开放端口主机</div>
-				<div class="value">{{.HostsWithOpenPort}}</div>
+				<div class="value">1</div>
 			</div>
 			<div class="card">
 				<div class="label">开放端口数</div>
-				<div class="value">{{.TotalOpenPorts}}</div>
+				<div class="value">1</div>
 			</div>
 			<div class="card">
 				<div class="label">主要协议数</div>
-				<div class="value">{{len .TopProtocols}}</div>
+				<div class="value">1</div>
 			</div>
 		</section>
 
@@ -258,21 +216,17 @@ func Savefile(results []ScanResult, aiText, aliveIPs []string) error {
 				<div class="card">
 					<div class="label">端口分布</div>
 					<ul class="count-list">
-						{{range .TopPorts}}
-						<li><span>{{.Name}}</span><strong>{{.Count}}</strong></li>
-						{{else}}
-						<li><span>暂无数据</span><strong>0</strong></li>
-						{{end}}
+						
+						<li><span>53</span><strong>1</strong></li>
+						
 					</ul>
 				</div>
 				<div class="card">
 					<div class="label">协议分布</div>
 					<ul class="count-list">
-						{{range .TopProtocols}}
-						<li><span>{{.Name}}</span><strong>{{.Count}}</strong></li>
-						{{else}}
-						<li><span>暂无数据</span><strong>0</strong></li>
-						{{end}}
+						
+						<li><span>DNS</span><strong>1</strong></li>
+						
 					</ul>
 				</div>
 			</div>
@@ -280,12 +234,12 @@ func Savefile(results []ScanResult, aiText, aliveIPs []string) error {
 
 		<section class="section">
 			<h2>主机详情</h2>
-			{{range .Hosts}}
+			
 			<div class="host">
 				<div class="host-meta">
-					<h3>{{.IP}}</h3>
-					<span class="badge">系统: {{.OS}}</span>
-					<span class="badge">开放端口: {{len .Results}}</span>
+					<h3>10.243.120.11</h3>
+					<span class="badge">系统: Linux</span>
+					<span class="badge">开放端口: 1</span>
 				</div>
 				<table>
 					<thead>
@@ -295,116 +249,26 @@ func Savefile(results []ScanResult, aiText, aliveIPs []string) error {
 						</tr>
 					</thead>
 					<tbody>
-						{{range .Results}}
+						
 						<tr>
-							<td>{{.Port}}</td>
-							<td>{{.Protocol}}</td>
+							<td>53</td>
+							<td>DNS</td>
 						</tr>
-						{{end}}
+						
 					</tbody>
 				</table>
 			</div>
-			{{else}}
-			<p class="empty">本次扫描未发现开放端口，或当前网段没有返回结果的主机。</p>
-			{{end}}
+			
 		</section>
 
 		<section class="section">
 			<h2>AI 分析</h2>
 			<div class="ai-box">
-				{{range .AiText}}
-				<p>{{.}}</p>
-				{{else}}
+				
 				<p>本次未附加 AI 分析结果。你可以配置 LLM_API_KEY 后重新运行。</p>
-				{{end}}
+				
 			</div>
 		</section>
 	</div>
 </body>
-</html>`
-
-	t, err := template.New("report").Parse(tmpl)
-	if err != nil {
-		return err
-	}
-
-	return t.Execute(file, data)
-}
-
-func buildReportData(results []ScanResult, aiText, aliveIPs []string) reportData {
-	hostMap := make(map[string][]ScanResult)
-	portCounts := make(map[string]int)
-	protocolCounts := make(map[string]int)
-	aliveSet := make(map[string]struct{})
-
-	for _, ip := range aliveIPs {
-		if ip == "" {
-			continue
-		}
-		aliveSet[ip] = struct{}{}
-	}
-
-	for _, result := range results {
-		hostMap[result.IP] = append(hostMap[result.IP], result)
-		portCounts[toKey(result.Port)]++
-		protocolCounts[result.Protocol]++
-	}
-
-	hosts := make([]reportHost, 0, len(hostMap))
-	for ip, hostResults := range hostMap {
-		sort.Slice(hostResults, func(i, j int) bool {
-			return hostResults[i].Port < hostResults[j].Port
-		})
-
-		hostOS := "Unknown"
-		if len(hostResults) > 0 && hostResults[0].OS != "" {
-			hostOS = hostResults[0].OS
-		}
-
-		hosts = append(hosts, reportHost{
-			IP:      ip,
-			OS:      hostOS,
-			Results: hostResults,
-		})
-	}
-
-	sort.Slice(hosts, func(i, j int) bool {
-		return CompareIPs(hosts[i].IP, hosts[j].IP) < 0
-	})
-
-	totalAliveHosts := len(aliveSet)
-	if totalAliveHosts < len(hosts) {
-		totalAliveHosts = len(hosts)
-	}
-
-	return reportData{
-		Hosts:             hosts,
-		AiText:            aiText,
-		GeneratedAt:       time.Now().Format("2006-01-02 15:04:05"),
-		TotalAliveHosts:   totalAliveHosts,
-		HostsWithOpenPort: len(hosts),
-		TotalOpenPorts:    len(results),
-		TopPorts:          sortCounts(portCounts),
-		TopProtocols:      sortCounts(protocolCounts),
-	}
-}
-
-func sortCounts(input map[string]int) []reportCount {
-	counts := make([]reportCount, 0, len(input))
-	for name, count := range input {
-		counts = append(counts, reportCount{Name: name, Count: count})
-	}
-
-	sort.Slice(counts, func(i, j int) bool {
-		if counts[i].Count == counts[j].Count {
-			return counts[i].Name < counts[j].Name
-		}
-		return counts[i].Count > counts[j].Count
-	})
-
-	return counts
-}
-
-func toKey(port int) string {
-	return strconv.Itoa(port)
-}
+</html>

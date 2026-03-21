@@ -12,7 +12,6 @@ func IcmpScan(ip string) bool {
 	p := fastping.NewPinger()
 	ra, err := net.ResolveIPAddr("ip4:icmp", ip)
 	if err != nil {
-		fmt.Println("Error resolving IP:", err)
 		return false
 	}
 	p.AddIPAddr(ra)
@@ -22,11 +21,9 @@ func IcmpScan(ip string) bool {
 		found = true
 	}
 	p.OnIdle = func() {}
-
 	p.MaxRTT = time.Second
-	err = p.Run()
-	if err != nil {
-		fmt.Println("Error running ping:", err)
+
+	if err := p.Run(); err != nil {
 		return false
 	}
 

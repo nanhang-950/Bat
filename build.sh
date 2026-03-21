@@ -1,3 +1,5 @@
 #!/bin/bash
 
-go build -ldflags="-s -w " -trimpath main.go
+set -euo pipefail
+
+go build -trimpath -ldflags="-s -w" .

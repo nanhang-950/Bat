@@ -1,7 +1,9 @@
 package fn
 
 import (
+	"bytes"
 	"fmt"
+	"net"
 	"sync"
 )
 
@@ -14,7 +16,7 @@ type ScanResult struct {
 	Bb       string
 }
 
-var CommonPorts = []int{22, 631, 514, 111, 135, 139, 445, 3389, 5585}
+var CommonPorts = []int{22, 111, 135, 139, 445, 514, 631, 3389, 5985}
 
 var OsCache sync.Map
 
@@ -25,11 +27,33 @@ func Banner() {
 	bat := `
   ██████╗  █████╗ ████████╗
   ██╔══██╗██╔══██╗╚══██╔══╝
-  ██████╔╝███████║   ██║   
-  ██╔══██╗██╔══██║   ██║   
-  ██████╔╝██║  ██║   ██║   
-  ╚═════╝ ╚═╝  ╚═╝   ╚═╝   
+  ██████╔╝███████║   ██║
+  ██╔══██╗██╔══██║   ██║
+  ██████╔╝██║  ██║   ██║
+  ╚═════╝ ╚═╝  ╚═╝   ╚═╝
     BAT version: 1.0.0
 `
 	fmt.Print(bat)
+}
+
+func CompareIPs(left, right string) int {
+	leftIP := net.ParseIP(left).To4()
+	rightIP := net.ParseIP(right).To4()
+
+	switch {
+	case leftIP == nil && rightIP == nil:
+		if left < right {
+			return -1
+		}
+		if left > right {
+			return 1
+		}
+		return 0
+	case leftIP == nil:
+		return 1
+	case rightIP == nil:
+		return -1
+	default:
+		return bytes.Compare(leftIP, rightIP)
+	}
 }
